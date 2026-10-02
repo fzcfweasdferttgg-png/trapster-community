@@ -1,6 +1,7 @@
 from trapster.modules.base import BaseProtocol, BaseHoneypot
 
 import asyncio
+import logging
 import datetime
 import os
 import re
@@ -21,6 +22,11 @@ PROTOCOL_HYBRID   = 0x00000002
 PROTOCOL_HYBRID_EX = 0x00000008
 
 
+def _has_content(path):
+    """True when *path* is an existing file with data (empty files don't count)."""
+    return path.is_file() and path.stat().st_size > 0
+
+
 class RdpProtocol(BaseProtocol):
 
     def __init__(self, config=None):
@@ -30,6 +36,7 @@ class RdpProtocol(BaseProtocol):
         self.config.setdefault("ntlm_domain", "WORKGROUP")
         self.protocol_name = "rdp"
         self.state = "CR"
+        self._tls_buf = bytearray()
         self.username = ""
         self.ntlm_challenge = os.urandom(8)
 
@@ -51,9 +58,38 @@ class RdpProtocol(BaseProtocol):
         # XP and early systems don't support NLA/TLS negotiation
         self._nla_supported = self._version_key not in ('winxp',)
 
+    _conn_count = {}
+
     def connection_made(self, transport):
         self.transport = transport
+        cap = 0
+        behavior = self.config.get('auth_behavior')
+        if isinstance(behavior, dict):
+            try:
+                cap = int(behavior.get('max_connections_per_ip', 0) or 0)
+            except (TypeError, ValueError):
+                cap = 0
+        self._conn_key = None
+        if cap > 0:
+            try:
+                host = transport.get_extra_info('peername')[0]
+            except Exception:
+                host = ''
+            n = self._conn_count.get(host, 0)
+            if n >= cap:
+                transport.close()
+                return
+            self._conn_key = host
+            self._conn_count[host] = n + 1
         self.logger.log(self.protocol_name + "." + self.logger.CONNECTION, self.transport)
+
+    def connection_lost(self, exc):
+        if getattr(self, '_conn_key', None) is not None:
+            n = self._conn_count.get(self._conn_key, 1) - 1
+            if n <= 0:
+                self._conn_count.pop(self._conn_key, None)
+            else:
+                self._conn_count[self._conn_key] = n
 
     def data_received(self, data):
         self.logger.log(self.protocol_name + "." + self.logger.DATA, self.transport, data=data)
@@ -62,6 +98,17 @@ class RdpProtocol(BaseProtocol):
             self._handle_cr(data)
         elif self.state == "NLA":
             self._handle_nla(data)
+        elif self.state == "MCS":
+            self._handle_mcs(data)
+        elif self.state == "TLS":
+            # Client data can arrive before the start_tls coroutine resumes
+            # and flips state to NLA (fast clients pipeline it right after the
+            # handshake) - buffer it instead of dropping. Capped so a client
+            # cannot grow the buffer without bound.
+            if len(self._tls_buf) < 65536:
+                self._tls_buf += data
+            else:
+                self.transport.close()
 
     # ---- Connection Request / Confirm ----
 
@@ -124,6 +171,7 @@ class RdpProtocol(BaseProtocol):
         self.username = match.group('username') if match else ''
 
         src_ref, requested_protocols = self._parse_cr(data)
+        self._requested_protocols = requested_protocols or 0
 
         self.logger.log(
             self.protocol_name + '.' + self.logger.LOGIN,
@@ -148,11 +196,15 @@ class RdpProtocol(BaseProtocol):
 
         self.transport.write(self._build_cc(src_ref, selected if include_neg else None))
 
+        self._selected_proto = selected
         if selected in (PROTOCOL_SSL, PROTOCOL_HYBRID, PROTOCOL_HYBRID_EX):
             self.state = 'TLS'
             asyncio.get_running_loop().create_task(self._start_tls())
         else:
-            self.transport.close()
+            # No NLA in this path: a real server continues with the MCS
+            # handshake, so do not fingerprint ourselves with an abrupt
+            # close - wait for the Connect Initial instead.
+            self.state = 'MCS'
 
     # ---- TLS upgrade ----
 
@@ -170,15 +222,128 @@ class RdpProtocol(BaseProtocol):
             self.transport.close()
             return
 
+        sni_certs = self.config.get('sni_certs') or {}
+        if isinstance(sni_certs, dict) and sni_certs:
+            loaded = {}
+            for name, pair in sni_certs.items():
+                if not isinstance(pair, dict):
+                    continue
+                k, c = pair.get('key'), pair.get('certificate')
+                if (k and c and _has_content(Path(k)) and _has_content(Path(c))):
+                    sub_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                    try:
+                        sub_ctx.load_cert_chain(certfile=c, keyfile=k)
+                        loaded[name.strip('.').lower()] = sub_ctx
+                    except Exception as e:
+                        logging.getLogger(__name__).warning(
+                            "sni_certs entry %r ignored: %r", name, e)
+                else:
+                    logging.getLogger(__name__).warning(
+                        "sni_certs entry %r ignored: key/certificate "
+                        "must exist and be non-empty", name)
+            if loaded:
+                def _pick_cert(ssl_sock, server_name, ctx):
+                    if not server_name:
+                        return
+                    new_ctx = loaded.get(server_name.strip('.').lower())
+                    if new_ctx is not None:
+                        try:
+                            ssl_sock.context = new_ctx
+                        except Exception as e:
+                            logging.getLogger(__name__).warning(
+                                "SNI callback error: %r", e)
+                ssl_ctx.sni_callback = _pick_cert
+
         loop = asyncio.get_running_loop()
         try:
             new_transport = await loop.start_tls(
                 self.transport, self, ssl_ctx, server_side=True
             )
             self.transport = new_transport
-            self.state = 'NLA'
+            self.state = ('NLA' if getattr(self, '_selected_proto', PROTOCOL_HYBRID)
+                          in (PROTOCOL_HYBRID, PROTOCOL_HYBRID_EX) else 'MCS')
+            if self._tls_buf:
+                buf = bytes(self._tls_buf)
+                self._tls_buf.clear()
+                self._handle_nla(buf)
         except Exception:
             self.transport.close()
+
+    # MCS Connect-Response assembled per MS-RDPBCGR 2.2.1.5 from a real
+    # FreeRDP server capture. GCC prefix and DomainParameters are verbatim;
+    # SC_NET/SC_MCS_MSGCHANNEL/SC_CORE are rebuilt per client request so the
+    # assigned channel IDs and echoed protocols always match the request.
+    _MCS_GCC_PREFIX = bytes.fromhex(
+        '000500147c00012a14760a01010001c0004d63446e3a')
+    _MCS_DOMAIN_PARAMS = bytes.fromhex(
+        '301a020122020103020100020101020100020101020300fff8020102')
+
+    @staticmethod
+    def _ber_len(n):
+        if n < 0x80:
+            return bytes([n])
+        if n < 0x100:
+            return bytes([0x81, n])
+        return bytes([0x82, n >> 8, n & 0xff])
+
+    def _build_mcs_connect_response(self, request):
+        """Build the MCS Connect-Response for this Connect-Initial.
+
+        The static virtual channel list (SC_NET) is sized to exactly the
+        channelCount the client requested (spec maximum 31): MCS channel id
+        0x03EB, the channel ids run from 0x03EC, and the message channel id
+        follows them. SC_CORE echoes clientRequestedProtocols and carries the
+        Windows Server 2019 version marker.
+        """
+        n = 4
+        # Client Network Data block (TS_UD_CS_NET): key 0xC003 LE ("03 c0"),
+        # length (2 LE, includes the 4-byte header), channelCount (4 LE),
+        # then channelCount CHANNEL_DEF entries of 12 bytes. Validate the
+        # length arithmetic so option bytes cannot spoof the parser.
+        off = 0
+        while True:
+            idx = request.find(b'\x03\xc0', off)
+            if idx == -1 or idx + 12 > len(request):
+                break
+            ln = int.from_bytes(request[idx + 2:idx + 4], 'little')
+            cnt = int.from_bytes(request[idx + 4:idx + 8], 'little')
+            if 0 < cnt <= 31 and ln == 8 + 12 * cnt and idx + ln <= len(request):
+                n = cnt
+                break
+            off = idx + 2
+        n = max(1, min(n, 31))
+
+        net = struct.pack('<HH', 0x03EB, n)
+        net += b''.join(struct.pack('<H', 0x03EC + i) for i in range(n))
+        blocks = (
+            struct.pack('<HH', 0x0C01, 16) + struct.pack(
+                '<III', 0x00080004,
+                getattr(self, '_requested_protocols', 0) or 0,
+                getattr(self, '_selected_proto', 0) or 0)
+            + struct.pack('<HH', 0x0C03, 4 + len(net)) + net
+            + struct.pack('<HH', 0x0C02, 12) + b'\x00' * 8
+            + struct.pack('<HH', 0x0C04, 6) + struct.pack('<H', 0x03EC + n)
+            + struct.pack('<HH', 0x0C08, 8) + struct.pack('<I', 1)
+        )
+
+        gcc = self._MCS_GCC_PREFIX + blocks
+        user_data = b'\x04' + self._ber_len(len(gcc)) + gcc
+        content = (b'\x0a\x01\x00' + b'\x02\x01\x00'
+                   + self._MCS_DOMAIN_PARAMS + user_data)
+        mcs = b'\x7f\x66' + self._ber_len(len(content)) + content
+        x224 = b'\x02\xf0\x80' + mcs
+        return b'\x03\x00' + struct.pack('>H', 4 + len(x224)) + x224
+
+    def _handle_mcs(self, data):
+        """Non-NLA peer sent the MCS Connect Initial: answer with a
+        protocol-plausible Connect-Response once, then keep quiet (a
+        stalled session reads far better than an instant close)."""
+        if getattr(self, '_mcs_done', False):
+            return
+        if b'\x7f\x65' not in data:
+            return
+        self._mcs_done = True
+        self.transport.write(self._build_mcs_connect_response(data))
 
     # ---- NLA / CredSSP / NTLM ----
 
@@ -327,11 +492,113 @@ class RdpProtocol(BaseProtocol):
         error      = tlv(0xa4, tlv(0x02, ec_bytes))   # [4] INTEGER errorCode
         return tlv(0x30, version + error)
 
+    _auth_state = {}
+
+    def _reaction(self, behavior, steps):
+        """Pick the reaction for this attempt from the configured sequence.
+
+        A step applies either for `attempts` tries or for `minutes` of wall
+        time; `loop` restarts the sequence after the last step, otherwise it
+        stays on the last one. The counter is per client IP (or global) and
+        resets after `reset_after_minutes` of inactivity.
+        """
+        now = __import__('time').time()
+        try:
+            host = self.transport.get_extra_info('peername')[0]
+        except Exception:
+            host = ''
+        key = host if behavior.get('per_ip', True) else '_all'
+        try:
+            reset = float(behavior.get('reset_after_minutes', 30) or 0) * 60
+        except (TypeError, ValueError):
+            reset = 1800
+        st = self._auth_state.get(key)
+        if st is None or (reset and now - st['last'] > reset):
+            st = {'idx': 0, 'count': 0, 'since': now}
+        st['last'] = now
+        self._auth_state[key] = st
+        if len(self._auth_state) > 4096:
+            for k, v in list(self._auth_state.items()):
+                if len(self._auth_state) <= 4096:
+                    break
+                if k != key and (reset == 0 or now - v['last'] > reset):
+                    self._auth_state.pop(k, None)
+
+        def advance():
+            if st['idx'] < len(steps) - 1:
+                st['idx'] += 1
+            elif behavior.get('loop'):
+                st['idx'] = 0
+            else:
+                return False
+            st['count'] = 0
+            st['since'] = now
+            return True
+
+        while True:
+            step = steps[st['idx']]
+            if not isinstance(step, dict):
+                step = {}
+            do = step.get('do', 'fail')
+            if do not in ('fail', 'slow_fail', 'hang', 'accept_void'):
+                logging.getLogger(__name__).warning(
+                    "auth_behavior step %r unknown, using 'fail'", do)
+                do = 'fail'
+            try:
+                delay = float(step.get('delay_seconds', 0) or 0)
+            except (TypeError, ValueError):
+                delay = 0
+            limit = step.get('attempts')
+            if limit is not None:
+                try:
+                    limit = int(limit)
+                except (TypeError, ValueError):
+                    limit = 1
+                st['count'] += 1
+                if st['count'] >= limit \
+                        and (st['idx'] < len(steps) - 1 or behavior.get('loop')):
+                    advance()
+                return do, delay
+            try:
+                window = float(step.get('minutes', 0) or 0) * 60
+            except (TypeError, ValueError):
+                window = 0
+            if window > 0 and now - st['since'] >= window and advance():
+                continue
+            return do, delay
+
+    async def _auth_response(self):
+        """Send the NLA verdict: stock failure, or the auth_behavior reaction."""
+        behavior = self.config.get('auth_behavior')
+        steps = behavior.get('steps') if isinstance(behavior, dict) else None
+        if not steps:
+            self.transport.write(self._build_credssp_error(0xC000006D))
+            self.transport.close()
+            return
+        try:
+            reaction, delay = self._reaction(behavior, steps)
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "auth_behavior config invalid, using stock response")
+            self.transport.write(self._build_credssp_error(0xC000006D))
+            self.transport.close()
+            return
+        if reaction == 'slow_fail':
+            await asyncio.sleep(max(0.0, min(float(delay), 3600.0)))
+        if reaction in ('fail', 'slow_fail'):
+            self.transport.write(self._build_credssp_error(0xC000006D))
+            self.transport.close()
+        elif reaction == 'accept_void':
+            self.transport.write(self._build_credssp_error(0x00000000))
+        # 'hang': keep the connection open and send nothing
+
     def _handle_nla(self, data):
         # CredSSP/SPNEGO wraps NTLM; locate the NTLMSSP signature within the blob
         idx = data.find(b'NTLMSSP\x00')
         if idx == -1 or len(data) - idx < 12:
-            self.transport.close()
+            # No NTLM here: the client speaks the MCS handshake instead
+            # (non-NLA peer) - treat as such rather than dropping it.
+            self._handle_mcs(data)
             return
 
         ntlm_data = data[idx:]
@@ -365,12 +632,11 @@ class RdpProtocol(BaseProtocol):
                         'password': creds['ntlm_hash'],
                     },
                 )
-            # Reply with a CredSSP wrong-password error (NTSTATUS STATUS_LOGON_FAILURE).
-            # Without this, xfreerdp gets an abrupt EOF while waiting for
-            # the server's pubKeyAuth and reports ERRCONNECT_CONNECT_TRANSPORT_FAILED.
-            # 0xC000006D is what a real Windows server returns for bad credentials.
-            self.transport.write(self._build_credssp_error(0xC000006D))
-            self.transport.close()
+            # Verdict per auth_behavior sequence if configured; otherwise the
+            # stock wrong-password error (0xC000006D STATUS_LOGON_FAILURE).
+            if not getattr(self, '_auth_done', False):
+                self._auth_done = True
+                asyncio.get_running_loop().create_task(self._auth_response())
 
         else:
             self.transport.close()
@@ -394,6 +660,13 @@ class RdpHoneypot(BaseHoneypot):
         self.handler.config = config
 
     def generate_certificate(self, config):
+        '''
+        Use the configured key/certificate files when both already exist.
+        Otherwise generate a self-signed pair (and write it to those paths).
+        '''
+        if _has_content(self.key_path) and _has_content(self.cert_path):
+            return
+
         self.key_path.parent.mkdir(parents=True, exist_ok=True)
         self.cert_path.parent.mkdir(parents=True, exist_ok=True)
 
